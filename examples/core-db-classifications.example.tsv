@@ -1,0 +1,8 @@
+# container<TAB>scope<TAB>reason
+# Keep this file aligned with the actual running ATMED-core database containers.
+# Any stale or unclassified entry makes atmed-core-db-export fail closed.
+wordpress-db	production	Active WordPress runtime project.
+moodle-db	production	Active Moodle runtime project.
+atmed-bigbluebutton-docker-postgres-1	production	Active BigBlueButton runtime project.
+atmed_customer_control_center-db-1	nonproduction	CCC is approved only as local dry-run/staging.
+atmed-provisioning-ledger-staging-wordpress-db-1	nonproduction	Compose project is explicitly staging.

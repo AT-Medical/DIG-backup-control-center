@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Fail-closed logical export of explicitly classified ATMED-core DB containers.
+set -euo pipefail
+set +x
+umask 077
+
+BASE_DIR="${ATMED_DB_EXPORT_BASE_DIR:-/var/lib/atmed-bcc/db-exports/core}"
+CLASSIFICATIONS="${ATMED_DB_EXPORT_CLASSIFICATIONS:-/etc/atmed-backup/core-db-classifications.tsv}"
+LOCK_FILE="${ATMED_DB_EXPORT_LOCK_FILE:-/run/lock/atmed-core-db-export.lock}"
+
+usage() {
+  cat <<'EOF'
+Usage: atmed-core-db-export [--help]
+Generate atomic logical exports for explicitly classified production DBs.
+EOF
+}
+
+case "${1:-}" in
+  "") ;;
+  -h|--help) usage; exit 0 ;;
+  *) echo "Unsupported argument: $1" >&2; exit 64 ;;
+esac
+
+for cmd in docker flock gzip sha256sum python3; do
+  command -v "$cmd" >/dev/null || { echo "Missing command: $cmd" >&2; exit 69; }
+done
+[[ -r "$CLASSIFICATIONS" ]] || { echo "Classification missing: $CLASSIFICATIONS" >&2; exit 66; }
+
+mkdir -p "$(dirname "$LOCK_FILE")" "$BASE_DIR"
+chmod 700 "$BASE_DIR"
+exec 9>"$LOCK_FILE"
+flock -n 9 || { echo "Another DB export is active" >&2; exit 75; }
+
+RUN_ID="core-db-$(date -u +%Y%m%dT%H%M%SZ)-$(openssl rand -hex 4)"
+TMP_DIR="$BASE_DIR/.${RUN_ID}.tmp"
+FINAL_DIR="$BASE_DIR/$RUN_ID"
+MANIFEST="$TMP_DIR/manifest.jsonl"
+mkdir -p "$TMP_DIR"
+chmod 700 "$TMP_DIR"
+cleanup() { rm -rf "$TMP_DIR"; }
+trap cleanup ERR INT TERM HUP
+: > "$MANIFEST"
+
+declare -A SCOPE
+while IFS=$'\t' read -r container scope _reason; do
+  [[ -z "${container:-}" || "$container" == \#* ]] && continue
+  [[ "$scope" == production || "$scope" == nonproduction ]] || { echo "Invalid scope: $container" >&2; exit 65; }
+  [[ -z "${SCOPE[$container]:-}" ]] || { echo "Duplicate classification: $container" >&2; exit 65; }
+  SCOPE["$container"]="$scope"
+done < "$CLASSIFICATIONS"
+
+mapfile -t DBS < <(docker ps --format '{{.Names}}|{{.Image}}' | awk -F'|' 'tolower($2) ~ /(mariadb|mysql|postgres)/ { print }')
+(( ${#DBS[@]} > 0 )) || { echo "No running database container found" >&2; exit 65; }
+for row in "${DBS[@]}"; do
+  container="${row%%|*}"
+  [[ -n "${SCOPE[$container]:-}" ]] || { echo "Unclassified database container: $container" >&2; exit 65; }
+done
+for container in "${!SCOPE[@]}"; do
+  # A non-production classification is an allow-list entry. It may legitimately
+  # be absent when its explicit staging stack is shut down; production entries
+  # remain fail-closed and must be running for every backup run.
+  [[ "${SCOPE[$container]}" == production ]] || continue
+  docker ps --format '{{.Names}}' | grep -Fxq "$container" || { echo "Stale classification: $container" >&2; exit 65; }
+done
+
+record() {
+  local engine="$1" container="$2" database="$3" dump="$4" mechanism="$5"
+  local size sha now
+  size="$(stat -c %s "$dump")"
+  (( size > 0 )) || { echo "Empty dump: $dump" >&2; exit 65; }
+  sha="$(sha256sum "$dump" | awk '{print $1}')"
+  now="$(date -u +%FT%TZ)"
+  python3 - "$engine" "$container" "$database" "$(basename "$dump")" "$size" "$sha" "$now" "$mechanism" >> "$MANIFEST" <<'PY'
+import json
+import sys
+keys = ("engine", "container", "database", "dump_file", "size_bytes", "sha256", "created_at", "mechanism")
+print(json.dumps(dict(zip(keys, sys.argv[1:])), sort_keys=True))
+PY
+}
+
+for row in "${DBS[@]}"; do
+  container="${row%%|*}"
+  image="${row#*|}"
+  [[ "${SCOPE[$container]}" == production ]] || continue
+  if [[ "${image,,}" =~ (mariadb|mysql) ]]; then
+    dump="$TMP_DIR/${container}.sql.gz"
+    docker exec "$container" sh -ceu '
+      password="${MARIADB_ROOT_PASSWORD:-${MYSQL_ROOT_PASSWORD:-}}"
+      [ -n "$password" ]
+      exec mariadb-dump -uroot -p"$password" --all-databases --single-transaction --quick \
+        --skip-lock-tables --routines --events --triggers --hex-blob
+    ' | gzip -9 > "$dump"
+    gzip -t "$dump"
+    record mariadb "$container" __all_databases__ "$dump" 'mariadb-dump --all-databases --single-transaction'
+  elif [[ "${image,,}" == *postgres* ]]; then
+    globals="$TMP_DIR/${container}.globals.sql.gz"
+    docker exec "$container" sh -ceu '
+      export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+      [ -n "$PGPASSWORD" ]
+      exec pg_dumpall -U "${POSTGRES_USER:-postgres}" --globals-only
+    ' | gzip -9 > "$globals"
+    gzip -t "$globals"
+    record postgres "$container" __globals__ "$globals" 'pg_dumpall --globals-only'
+    mapfile -t names < <(docker exec "$container" sh -ceu '
+      export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+      [ -n "$PGPASSWORD" ]
+      psql -U "${POSTGRES_USER:-postgres}" -d postgres -Atc "SELECT datname FROM pg_database WHERE datistemplate = false AND datname <> '\''postgres'\'' ORDER BY datname"
+    ')
+    (( ${#names[@]} > 0 )) || { echo "No user DB in $container" >&2; exit 65; }
+    for database in "${names[@]}"; do
+      [[ "$database" =~ ^[A-Za-z0-9_]+$ ]] || { echo "Unsupported DB identifier" >&2; exit 65; }
+      dump="$TMP_DIR/${container}.${database}.dump"
+      docker exec "$container" sh -ceu '
+        export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+        [ -n "$PGPASSWORD" ]
+        exec pg_dump -U "${POSTGRES_USER:-postgres}" -d "$1" --format=custom
+      ' sh "$database" > "$dump"
+      [[ "$(head -c 5 "$dump")" == PGDMP ]] || { echo "Invalid PostgreSQL dump: $dump" >&2; exit 65; }
+      record postgres "$container" "$database" "$dump" 'pg_dump --format=custom'
+    done
+  else
+    echo "Unsupported DB image: $image" >&2
+    exit 65
+  fi
+done
+
+[[ -s "$MANIFEST" ]] || { echo "No production dumps generated" >&2; exit 65; }
+printf '%s\n' "$RUN_ID" > "$TMP_DIR/RUN_ID"
+printf '%s\n' "$(date -u +%FT%TZ)" > "$TMP_DIR/COMPLETED_AT"
+chmod 600 "$TMP_DIR"/*
+mv "$TMP_DIR" "$FINAL_DIR"
+ln -sfn "$RUN_ID" "$BASE_DIR/current.new"
+mv -Tf "$BASE_DIR/current.new" "$BASE_DIR/current"
+trap - ERR INT TERM HUP
+printf 'STATUS=OK\nRUN_ID=%s\nEXPORT_DIR=%s\nMANIFEST=%s\n' "$RUN_ID" "$FINAL_DIR" "$FINAL_DIR/manifest.jsonl"
