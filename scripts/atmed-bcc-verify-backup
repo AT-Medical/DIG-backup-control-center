@@ -164,7 +164,10 @@ for provider in r2 hetzner; do
     echo "VERIFY_ERROR=hostname_not_restored provider=$provider" >&2
     exit 70
   }
-  [[ -f "$restore_target/etc/os-release" ]] || {
+  # Ubuntu commonly provides /etc/os-release as a relative symlink into
+  # /usr/lib. The BCC Core plan deliberately restores /etc only, so preserve
+  # and validate the restored link without requiring its unselected target.
+  [[ -e "$restore_target/etc/os-release" || -L "$restore_target/etc/os-release" ]] || {
     echo "VERIFY_ERROR=os_release_not_restored provider=$provider" >&2
     exit 70
   }
