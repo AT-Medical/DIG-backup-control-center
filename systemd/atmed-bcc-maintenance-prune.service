@@ -1,0 +1,16 @@
+[Unit]
+Description=ATMED BCC Repository Maintenance / Restic Prune
+Wants=network-online.target
+After=network-online.target
+Conflicts=atmed-bcc-backup.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/atmed-bcc-maintenance-prune
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=12h
+
+[Install]
+WantedBy=multi-user.target

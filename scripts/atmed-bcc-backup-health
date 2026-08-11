@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -u -o pipefail
+
+OUT_DIR="/srv/atmed-backup-control/health"
+LOG="$OUT_DIR/health-$(date -u +%Y%m%dT%H%M%SZ).log"
+LATEST="$OUT_DIR/latest.log"
+STATUS="$OUT_DIR/latest.status"
+DB="/srv/atmed-backup-control/index/backup-control.db"
+SECRET_SOPS="/etc/atmed-backup/secrets/remote-backup.sops.env"
+MIN_VERSION="$(cat /etc/atmed-backup/rclone-min-version 2>/dev/null || echo 1.74.2)"
+FAIL=0
+
+mkdir -p "$OUT_DIR"
+
+ok() { echo "OK: $*"; }
+fail() { echo "FAIL: $*"; FAIL=1; }
+
+{
+  echo "ATMED BCC Backup Health"
+  echo "Date: $(date -Is)"
+  echo "Host: $(hostname)"
+  echo
+
+  if systemctl is-enabled --quiet atmed-bcc-backup.timer && systemctl is-active --quiet atmed-bcc-backup.timer; then
+    ok "backup timer active and enabled"
+  else
+    fail "backup timer is not active and enabled"
+  fi
+
+  if systemctl is-active --quiet atmed-bcc-backup.service; then
+    ok "backup service currently active"
+  else
+    ok "backup service idle"
+  fi
+
+  LAST_RUN="$(sqlite3 "$DB" "select run_id||'|'||status||'|'||started_at||'|'||coalesce(finished_at,'')||'|'||coalesce(log_path,'') from backup_runs where run_id like 'bcc-%' order by started_at desc limit 1;" 2>/dev/null || true)"
+  IFS='|' read -r LAST_ID LAST_STATUS LAST_STARTED LAST_FINISHED LAST_LOG <<< "$LAST_RUN"
+  if [ "$LAST_STATUS" = "ok" ]; then
+    ok "latest run successful: ${LAST_ID:-unknown}"
+  else
+    fail "latest run is not successful: ${LAST_RUN:-missing}"
+  fi
+  if [ -n "${LAST_LOG:-}" ] && [ -f "$LAST_LOG" ] && grep -q 'Exit-Code des Backup-Runs: 0' "$LAST_LOG"; then
+    ok "latest run log has exit code 0"
+  else
+    fail "latest run log does not confirm exit code 0"
+  fi
+
+  echo
+  echo "RCLONE_VERSION_MINIMUM=$MIN_VERSION"
+  for target in ATINFRA-mail ATINFRA-control ATINFRA-backup ATINFRA-gateway ATINFRA-com ATMED-core ATDIG-core AT-core; do
+    VERSION="$(timeout 20 ssh -o BatchMode=yes -o ConnectTimeout=8 "$target" 'rclone version 2>/dev/null | sed -n "1s/^rclone v//p"' 2>/dev/null || true)"
+    if [ -z "$VERSION" ]; then
+      fail "$target rclone version unavailable"
+    elif [ "$(printf '%s\n%s\n' "$MIN_VERSION" "$VERSION" | sort -V | head -1)" = "$MIN_VERSION" ]; then
+      ok "$target rclone $VERSION"
+    else
+      fail "$target rclone $VERSION is below $MIN_VERSION"
+    fi
+  done
+
+  export SOPS_AGE_KEY_FILE=/root/.config/sops/age/keys.txt
+  if [ -f "$SECRET_SOPS" ]; then
+    set -a
+    . <(SOPS_AGE_KEY_FILE=/root/.config/sops/age/keys.txt sops -d "$SECRET_SOPS" 2>/dev/null)
+    set +a
+    export HOME=/root XDG_CACHE_HOME=/root/.cache RESTIC_CACHE_DIR=/root/.cache/restic RCLONE_CONFIG=/root/.config/rclone/rclone.conf
+    for provider in r2 hetzner; do
+      case "$provider" in
+        r2) repo="${RESTIC_REPOSITORY_R2:-}" ;;
+        hetzner) repo="${RESTIC_REPOSITORY_HETZNER:-}" ;;
+      esac
+      COUNT="$(timeout 120 restic -r "$repo" snapshots --json 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
+      if [ "${COUNT:-0}" -gt 0 ]; then ok "$provider repository readable ($COUNT snapshots)"; else fail "$provider repository not readable"; fi
+    done
+  else
+    fail "backup secrets unavailable"
+  fi
+
+  echo
+  if [ "$FAIL" -eq 0 ]; then
+    echo "ATMED_BCC_HEALTH=OK"
+    echo OK > "$STATUS"
+  else
+    echo "ATMED_BCC_HEALTH=FAILED"
+    echo FAILED > "$STATUS"
+  fi
+} > "$LOG" 2>&1
+
+cp "$LOG" "$LATEST"
+exit "$FAIL"

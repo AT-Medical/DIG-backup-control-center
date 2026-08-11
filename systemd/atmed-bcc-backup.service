@@ -1,19 +1,12 @@
 [Unit]
-Description=ATMED-BCC backup orchestration
-After=network-online.target
+Description=ATMED Backup Control Center - Remote Backup Run
 Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/opt/atmed-bcc
-ExecStart=/opt/atmed-bcc/scripts/atmed-bcc-run-backup --config-dir /etc/atmed-bcc
-User=atmed-bcc
-Group=atmed-bcc
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/atmed-bcc /var/log/atmed-bcc
-
-[Install]
-WantedBy=multi-user.target
+ExecStart=/usr/local/bin/atmed-bcc-run-backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=12h
