@@ -137,7 +137,10 @@ for provider in r2 hetzner; do
   # Restic 0.18 `ls` emits paths directly, without the old mode/owner columns.
   # Select a dump from this run only, never an older export that happens to be
   # retained in the same snapshot.
-  dump_path="$(restic -r "$repo" ls "$sample_snapshot" 2>/dev/null | awk -v prefix="$export_prefix" 'index($0, prefix) == 1 && $0 ~ /\.(sql|dump)(\.gz)?$/ {print; exit}')"
+  dump_path="$(restic -r "$repo" ls "$sample_snapshot" 2>/dev/null | awk -v prefix="$export_prefix" '
+    index($0, prefix) == 1 && $0 ~ /\.(sql|dump)(\.gz)?$/ && first == "" { first = $0 }
+    END { if (first != "") print first }
+  ')"
   [[ -n "$dump_path" ]] || {
     echo "VERIFY_ERROR=consistent_database_dump_not_found provider=$provider endpoint=core" >&2
     exit 70
