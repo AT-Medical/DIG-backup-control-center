@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+set +x
+umask 077
+
+AGE_KEY_FILE="/root/.config/sops/age/keys.txt"
+SECRET_SOPS="/etc/atmed-backup/secrets/remote-backup.sops.env"
+DB="/srv/atmed-backup-control/index/backup-control.db"
+WORK_ROOT="/srv/atmed-backup-control/restore-tests"
+MAX_AGE_SECONDS="${MAX_AGE_SECONDS:-86400}"
+
+usage() {
+  cat <<'USAGE'
+Usage: atmed-bcc-verify-backup [--run-id RUN_ID]
+
+Validates a completed BCC run without creating snapshots. The verifier requires
+complete two-provider coverage, reads every stored Restic data blob, and makes
+an isolated restore of configuration plus a database-dump candidate when one is
+present. It never prints decrypted configuration values.
+USAGE
+}
+
+RUN_ID=""
+case "${1:-}" in
+  "") ;;
+  --run-id)
+    RUN_ID="${2:-}"
+    [[ -n "$RUN_ID" ]] || { echo "--run-id requires a value" >&2; exit 64; }
+    [[ $# -eq 2 ]] || { usage >&2; exit 64; }
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    exit 64
+    ;;
+esac
+
+for command in sops sqlite3 restic jq flock; do
+  command -v "$command" >/dev/null 2>&1 || {
+    echo "VERIFY_ERROR=missing_required_command:$command" >&2
+    exit 69
+  }
+done
+
+[[ -r "$AGE_KEY_FILE" && -r "$SECRET_SOPS" && -r "$DB" ]] || {
+  echo "VERIFY_ERROR=required_backup_material_unavailable" >&2
+  exit 69
+}
+
+# Do not validate against a repository while a writer holds the BCC lock.
+exec 9>/run/lock/atmed-bcc-backup.lock
+flock -n 9 || {
+  echo "VERIFY_ERROR=backup_run_active" >&2
+  exit 75
+}
+
+if [[ -z "$RUN_ID" ]]; then
+  RUN_ID="$(sqlite3 "$DB" "SELECT run_id FROM backup_runs WHERE status='ok' AND finished_at IS NOT NULL ORDER BY id DESC LIMIT 1;")"
+fi
+[[ -n "$RUN_ID" ]] || { echo "VERIFY_ERROR=no_completed_backup_run" >&2; exit 70; }
+
+VERIFY_LOG_DIR="/srv/atmed-backup-control/health"
+mkdir -p "$VERIFY_LOG_DIR"
+VERIFY_LOG="$VERIFY_LOG_DIR/verification-${RUN_ID}-$(date -u +%Y%m%dT%H%M%SZ).log"
+exec > >(tee -a "$VERIFY_LOG") 2>&1
+
+IFS='|' read -r FINISHED_AT SNAPSHOT_COUNT FAILURE_COUNT <<EOF
+$(sqlite3 -noheader -separator '|' "$DB" "SELECT COALESCE(finished_at,''), (SELECT COUNT(*) FROM backup_snapshots WHERE run_id='$RUN_ID' AND status='ok'), (SELECT COUNT(*) FROM backup_snapshots WHERE run_id='$RUN_ID' AND status<>'ok') FROM backup_runs WHERE run_id='$RUN_ID';")
+EOF
+
+[[ -n "$FINISHED_AT" ]] || { echo "VERIFY_ERROR=run_not_completed run_id=$RUN_ID" >&2; exit 70; }
+[[ "$SNAPSHOT_COUNT" =~ ^[0-9]+$ && "$FAILURE_COUNT" =~ ^[0-9]+$ ]] || {
+  echo "VERIFY_ERROR=invalid_run_metadata run_id=$RUN_ID" >&2
+  exit 70
+}
+(( SNAPSHOT_COUNT == 16 && FAILURE_COUNT == 0 )) || {
+  echo "VERIFY_ERROR=incomplete_snapshot_coverage run_id=$RUN_ID ok_snapshots=$SNAPSHOT_COUNT failed_snapshots=$FAILURE_COUNT" >&2
+  exit 70
+}
+
+finished_epoch="$(date -d "$FINISHED_AT" +%s)"
+age_seconds=$(( $(date +%s) - finished_epoch ))
+(( age_seconds >= 0 && age_seconds <= MAX_AGE_SECONDS )) || {
+  echo "VERIFY_ERROR=backup_too_old run_id=$RUN_ID age_seconds=$age_seconds" >&2
+  exit 70
+}
+
+set -a
+# shellcheck disable=SC1090
+. <(SOPS_AGE_KEY_FILE="$AGE_KEY_FILE" sops -d "$SECRET_SOPS")
+set +a
+
+repo_for() {
+  case "$1" in
+    r2) printf '%s\n' "${RESTIC_REPOSITORY_R2:?missing_r2_repository}" ;;
+    hetzner) printf '%s\n' "${RESTIC_REPOSITORY_HETZNER:?missing_hetzner_repository}" ;;
+    *) return 64 ;;
+  esac
+}
+
+WORK_DIR="$WORK_ROOT/verification-${RUN_ID}-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$WORK_DIR"
+cleanup() { rm -rf "$WORK_DIR"; }
+trap cleanup EXIT
+
+echo "VERIFY_RUN_ID=$RUN_ID"
+echo "VERIFY_BACKUP_AGE_SECONDS=$age_seconds"
+echo "VERIFY_SNAPSHOT_COVERAGE=$SNAPSHOT_COUNT"
+
+for provider in r2 hetzner; do
+  repo="$(repo_for "$provider")"
+  echo "VERIFY_REPOSITORY=$provider phase=read_data_check"
+  restic -r "$repo" check --read-data >/dev/null
+
+  while IFS='|' read -r endpoint snapshot_id; do
+    [[ -n "$endpoint" && -n "$snapshot_id" ]] || continue
+    restic -r "$repo" snapshots "$snapshot_id" --json | jq -e 'length == 1' >/dev/null
+  done < <(sqlite3 -noheader -separator '|' "$DB" "SELECT endpoint, snapshot_id FROM backup_snapshots WHERE run_id='$RUN_ID' AND provider='$provider' AND status='ok' ORDER BY endpoint;")
+
+  sample_snapshot="$(sqlite3 "$DB" "SELECT snapshot_id FROM backup_snapshots WHERE run_id='$RUN_ID' AND provider='$provider' AND endpoint='core' AND status='ok' LIMIT 1;")"
+  [[ -n "$sample_snapshot" ]] || {
+    echo "VERIFY_ERROR=missing_core_snapshot provider=$provider" >&2
+    exit 70
+  }
+
+  restore_target="$WORK_DIR/$provider"
+  mkdir -p "$restore_target"
+  export_run_id="$(sqlite3 "$DB" "SELECT substr(message, length('Konsistente Exporte: ') + 1) FROM bcc_runtime_events WHERE run_id='$RUN_ID' AND event_type='core_database_export' AND status='ok' ORDER BY id DESC LIMIT 1;")"
+  [[ "$export_run_id" =~ ^core-db-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}$ ]] || {
+    echo "VERIFY_ERROR=missing_or_invalid_core_export_run provider=$provider" >&2
+    exit 70
+  }
+  export_prefix="/var/lib/atmed-bcc/db-exports/core/$export_run_id/"
+  # Restic 0.18 `ls` emits paths directly, without the old mode/owner columns.
+  # Select a dump from this run only, never an older export that happens to be
+  # retained in the same snapshot.
+  dump_path="$(restic -r "$repo" ls "$sample_snapshot" 2>/dev/null | awk -v prefix="$export_prefix" 'index($0, prefix) == 1 && $0 ~ /\.(sql|dump)(\.gz)?$/ {print; exit}')"
+  [[ -n "$dump_path" ]] || {
+    echo "VERIFY_ERROR=consistent_database_dump_not_found provider=$provider endpoint=core" >&2
+    exit 70
+  }
+  includes=(--include /etc/hostname --include /etc/os-release --include '/**/REMOTE-METADATA.txt')
+  includes+=(--include "$dump_path")
+
+  echo "VERIFY_REPOSITORY=$provider phase=isolated_restore"
+  restic -r "$repo" restore "$sample_snapshot" --target "$restore_target" "${includes[@]}" >/dev/null
+  find "$restore_target" -type f -path '*/etc/hostname' -print -quit | grep -q .
+  find "$restore_target" -type f -path '*/etc/os-release' -print -quit | grep -q .
+  restored_dump="$(find "$restore_target" -type f \( -name '*.sql' -o -name '*.dump' -o -name '*.sql.gz' -o -name '*.dump.gz' \) -print -quit)"
+  [[ -n "$restored_dump" ]] || { echo "VERIFY_ERROR=database_dump_not_restored provider=$provider" >&2; exit 70; }
+  case "$restored_dump" in
+    *.gz) gzip -t "$restored_dump" ;;
+    *) test -s "$restored_dump" ;;
+  esac
+done
+
+echo "VERIFY_RESULT=OK run_id=$RUN_ID"
