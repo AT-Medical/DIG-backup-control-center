@@ -9,6 +9,13 @@ DB="/srv/atmed-backup-control/index/backup-control.db"
 WORK_ROOT="/srv/atmed-backup-control/restore-tests"
 MAX_AGE_SECONDS="${MAX_AGE_SECONDS:-86400}"
 
+on_error() {
+  local rc="$?" line="$1"
+  echo "VERIFY_ERROR=unexpected_failure line=$line exit_code=$rc" >&2
+  exit "$rc"
+}
+trap 'on_error "$LINENO"' ERR
+
 usage() {
   cat <<'USAGE'
 Usage: atmed-bcc-verify-backup [--run-id RUN_ID]
@@ -113,11 +120,14 @@ echo "VERIFY_SNAPSHOT_COVERAGE=$SNAPSHOT_COUNT"
 for provider in r2 hetzner; do
   repo="$(repo_for "$provider")"
   echo "VERIFY_REPOSITORY=$provider phase=read_data_check"
-  restic -r "$repo" check --read-data >/dev/null
+  # The host-level BCC lock is held for this complete verifier. These read-only
+  # operations therefore do not need repository locks, which avoids stale
+  # provider locks if a transport is interrupted.
+  restic --no-lock -r "$repo" check --read-data >/dev/null
 
   while IFS='|' read -r endpoint snapshot_id; do
     [[ -n "$endpoint" && -n "$snapshot_id" ]] || continue
-    restic -r "$repo" snapshots "$snapshot_id" --json | jq -e 'length == 1' >/dev/null
+    restic --no-lock -r "$repo" snapshots "$snapshot_id" --json | jq -e 'length == 1' >/dev/null
   done < <(sqlite3 -noheader -separator '|' "$DB" "SELECT endpoint, snapshot_id FROM backup_snapshots WHERE run_id='$RUN_ID' AND provider='$provider' AND status='ok' ORDER BY endpoint;")
 
   sample_snapshot="$(sqlite3 "$DB" "SELECT snapshot_id FROM backup_snapshots WHERE run_id='$RUN_ID' AND provider='$provider' AND endpoint='core' AND status='ok' LIMIT 1;")"
@@ -137,7 +147,7 @@ for provider in r2 hetzner; do
   # Restic 0.18 `ls` emits paths directly, without the old mode/owner columns.
   # Select a dump from this run only, never an older export that happens to be
   # retained in the same snapshot.
-  dump_path="$(restic -r "$repo" ls "$sample_snapshot" 2>/dev/null | awk -v prefix="$export_prefix" '
+  dump_path="$(restic --no-lock -r "$repo" ls "$sample_snapshot" 2>/dev/null | awk -v prefix="$export_prefix" '
     index($0, prefix) == 1 && $0 ~ /\.(sql|dump)(\.gz)?$/ && first == "" { first = $0 }
     END { if (first != "") print first }
   ')"
@@ -149,9 +159,15 @@ for provider in r2 hetzner; do
   includes+=(--include "$dump_path")
 
   echo "VERIFY_REPOSITORY=$provider phase=isolated_restore"
-  restic -r "$repo" restore "$sample_snapshot" --target "$restore_target" "${includes[@]}" >/dev/null
-  find "$restore_target" -type f -path '*/etc/hostname' -print -quit | grep -q .
-  find "$restore_target" -type f -path '*/etc/os-release' -print -quit | grep -q .
+  restic --no-lock -r "$repo" restore "$sample_snapshot" --target "$restore_target" "${includes[@]}" >/dev/null
+  [[ -f "$restore_target/etc/hostname" ]] || {
+    echo "VERIFY_ERROR=hostname_not_restored provider=$provider" >&2
+    exit 70
+  }
+  [[ -f "$restore_target/etc/os-release" ]] || {
+    echo "VERIFY_ERROR=os_release_not_restored provider=$provider" >&2
+    exit 70
+  }
   restored_dump="$(find "$restore_target" -type f \( -name '*.sql' -o -name '*.dump' -o -name '*.sql.gz' -o -name '*.dump.gz' \) -print -quit)"
   [[ -n "$restored_dump" ]] || { echo "VERIFY_ERROR=database_dump_not_restored provider=$provider" >&2; exit 70; }
   case "$restored_dump" in
