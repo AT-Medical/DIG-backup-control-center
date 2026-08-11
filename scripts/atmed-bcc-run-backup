@@ -1,98 +1,734 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
-CONFIG_DIR="$REPO_DIR/examples"
-MODE="dry-run"
-
-log() {
-  printf '[atmed-bcc-run-backup] %s\n' "$*"
-}
-
-die() {
-  log "ERROR: $*" >&2
-  exit 1
-}
+set +x
+umask 077
 
 usage() {
   cat <<'USAGE'
-Usage: atmed-bcc-run-backup [--config-dir PATH] [--dry-run|--execute]
+Usage: atmed-bcc-run-backup
 
-Default mode is --dry-run. The bootstrap scaffold validates configuration and
-shows the endpoint/provider plan. Live restic/rclone execution must be added by
-operators in their site-specific deployment.
+Runs one complete ATMED BCC backup. This command intentionally accepts no
+operational arguments. Use the dedicated verification command for restore and
+integrity checks; --help must never start a backup.
 USAGE
 }
 
-validate_config() {
-  python3 - "$CONFIG_DIR" <<'PY'
-import json
-import pathlib
-import sys
+case "${1:-}" in
+  "") ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    echo "Unsupported argument: $1" >&2
+    usage >&2
+    exit 64
+    ;;
+esac
 
-config_dir = pathlib.Path(sys.argv[1])
-required_endpoint = {"name", "ssh_alias", "role", "enabled", "include_paths", "exclude_patterns", "rpo", "rto"}
-required_provider = {"name", "type", "remote_name", "repository_path", "enabled", "repository"}
-
-for file_name, required in (("endpoints.example.json", required_endpoint), ("providers.example.json", required_provider)):
-    data = json.loads((config_dir / file_name).read_text())
-    if not isinstance(data, list) or not data:
-        raise SystemExit(f"{file_name} must contain a non-empty JSON list")
-    for entry in data:
-        missing = sorted(required - entry.keys())
-        if missing:
-            raise SystemExit(f"{file_name} entry {entry!r} is missing: {', '.join(missing)}")
-PY
-}
-
-print_plan() {
-  python3 - "$CONFIG_DIR" <<'PY'
-import json
-import pathlib
-import sys
-
-config_dir = pathlib.Path(sys.argv[1])
-endpoints = [item for item in json.loads((config_dir / "endpoints.example.json").read_text()) if item.get("enabled")]
-providers = [item for item in json.loads((config_dir / "providers.example.json").read_text()) if item.get("enabled")]
-print("Planned backup matrix:")
-for endpoint in endpoints:
-    for provider in providers:
-        print(f"- endpoint={endpoint['name']} provider={provider['name']} repository={provider['repository']}")
-print(f"Total combinations: {len(endpoints) * len(providers)}")
-PY
-}
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --config-dir)
-      shift
-      [[ $# -gt 0 ]] || die "--config-dir requires a value"
-      CONFIG_DIR="$1"
-      ;;
-    --dry-run)
-      MODE="dry-run"
-      ;;
-    --execute)
-      MODE="execute"
-      ;;
-    --help|-h)
-      usage
-      exit 0
-      ;;
-    *)
-      die "Unknown argument: $1"
-      ;;
-  esac
-  shift
-done
-
-[[ -d "$CONFIG_DIR" ]] || die "Configuration directory not found: $CONFIG_DIR"
-validate_config
-print_plan
-
-if [[ "$MODE" == "execute" ]]; then
-  die "Live backup execution is intentionally not wired into the bootstrap scaffold. Integrate site-specific restic/rclone commands before using this entrypoint for production runs."
+# Prevent concurrent manual, timer, or dashboard-triggered runs from
+# contending for the same Restic repositories.
+exec 9>/run/lock/atmed-bcc-backup.lock
+if ! flock -n 9; then
+  echo "Backup-Lauf bereits aktiv; dieser Start wird übersprungen."
+  exit 75
 fi
 
-log "Dry-run complete. Configuration structure is valid."
+AGE_KEY_FILE="/root/.config/sops/age/keys.txt"
+SECRET_SOPS="/etc/atmed-backup/secrets/remote-backup.sops.env"
+DB="/srv/atmed-backup-control/index/backup-control.db"
+
+LOG_DIR="/srv/atmed-backup-control/logs"
+STATE_DIR="/srv/atmed-backup-control/state"
+RESTORE_DIR="/srv/atmed-backup-control/restore-tests"
+TMP_ROOT="/srv/atmed-backup-control/tmp"
+
+mkdir -p "$LOG_DIR" "$STATE_DIR" "$RESTORE_DIR" "$TMP_ROOT"
+
+RUN_ID="bcc-$(date -u +%Y%m%dT%H%M%SZ)-$(openssl rand -hex 4)"
+LOG="$LOG_DIR/$RUN_ID.log"
+STARTED_AT="$(date -Is)"
+
+exec > >(tee -a "$LOG") 2>&1
+
+echo "============================================================"
+echo " ATMED BCC Backup Run"
+echo " Run-ID: $RUN_ID"
+echo " Date: $(date -Is)"
+echo " Host: $(hostname)"
+echo "============================================================"
+
+set -a
+. <(SOPS_AGE_KEY_FILE="$AGE_KEY_FILE" sops -d "$SECRET_SOPS")
+set +a
+
+export HOME="${HOME:-/root}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/root/.cache}"
+export RESTIC_CACHE_DIR="${RESTIC_CACHE_DIR:-/root/.cache/restic}"
+export RCLONE_CONFIG="${RCLONE_CONFIG:-/root/.config/rclone/rclone.conf}"
+
+mkdir -p "$RESTIC_CACHE_DIR" "$TMP_ROOT"
+chmod 700 "$RESTIC_CACHE_DIR" "$TMP_ROOT"
+
+sql_escape() {
+  printf "%s" "${1:-}" | sed "s/'/''/g"
+}
+
+db_exec() {
+  sqlite3 "$DB" "$1" >/dev/null 2>&1 || true
+}
+
+notify() {
+  local topic="${1:-atmed-notifications}"
+  local title="${2:-ATMED-BCC}"
+  local message="${3:-}"
+  local priority="${4:-default}"
+
+  if [ -z "${NTFY_BASE_URL:-}" ]; then
+    return 0
+  fi
+
+  local base="${NTFY_BASE_URL%/}"
+  local args=(-fsS -H "Title: $title" -H "Priority: $priority")
+
+  if [ -n "${NTFY_TOKEN:-}" ]; then
+    args+=(-H "Authorization: Bearer $NTFY_TOKEN")
+  fi
+
+  curl "${args[@]}" -d "$message" "$base/$topic" >/dev/null 2>&1 || true
+}
+
+finish_run_db() {
+  local status="$1"
+  local icon="$2"
+  local summary="$3"
+  local error="${4:-}"
+  local finished
+  finished="$(date -Is)"
+
+  db_exec "UPDATE backup_runs
+          SET finished_at='$(sql_escape "$finished")',
+              status='$(sql_escape "$status")',
+              status_icon='$(sql_escape "$icon")',
+              summary='$(sql_escape "$summary")',
+              error_message='$(sql_escape "$error")'
+          WHERE run_id='$(sql_escape "$RUN_ID")';"
+}
+
+db_event() {
+  local event_type="${1:-event}"
+  local endpoint="${2:-}"
+  local provider="${3:-}"
+  local status="${4:-info}"
+  local message="${5:-}"
+
+  db_exec "INSERT INTO bcc_runtime_events
+          (run_id, event_type, endpoint, provider, status, message)
+          VALUES
+          ('$(sql_escape "$RUN_ID")',
+           '$(sql_escape "$event_type")',
+           '$(sql_escape "$endpoint")',
+           '$(sql_escape "$provider")',
+           '$(sql_escape "$status")',
+           '$(sql_escape "$message")');"
+}
+
+on_interrupt() {
+  local signal="$1"
+  echo "Backup-Lauf kontrolliert unterbrochen: $signal"
+  finish_run_db "interrupted" "🟠" "Backup kontrolliert unterbrochen" "signal:$signal"
+  db_event "run_interrupted" "" "" "interrupted" "signal:$signal"
+  trap - INT TERM HUP
+  exit 130
+}
+
+trap 'on_interrupt INT' INT
+trap 'on_interrupt TERM' TERM
+trap 'on_interrupt HUP' HUP
+
+on_error() {
+  local line="${1:-unknown}"
+  local err="Fehler in Zeile $line"
+  echo "$err"
+  notify "${NTFY_TOPIC_ALERTS:-atmed-alerts}" "⚠️ Fehler bei Backup" "Run $RUN_ID fehlgeschlagen: $err" "high"
+  finish_run_db "failed" "🔴" "Backup fehlgeschlagen" "$err"
+  exit 1
+}
+
+trap 'on_error "$LINENO"' ERR
+
+atmed_bcc_cleanup_runtime_artifacts() {
+  local rc="$?"
+  echo
+  echo "=== Runtime-Cleanup lokaler temporärer Artefakte ==="
+
+  # Restore-Artefakte älter als 2 Tage entfernen.
+  find "$RESTORE_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +2 -print -exec rm -rf {} \; 2>/dev/null || true
+
+  # Alte Check-/Restore-Logs im TMP_ROOT nach 14 Tagen entfernen.
+  find "$TMP_ROOT" -type f \( -name "check-*.log" -o -name "restore-*.log" \) -mtime +14 -print -delete 2>/dev/null || true
+
+  # Alte leere temporäre Verzeichnisse entfernen.
+  find "$TMP_ROOT" -mindepth 1 -type d -empty -mtime +1 -print -delete 2>/dev/null || true
+
+  # Altes lokales Tier0-Staging defensiv leeren, sofern kein alter Tier0-Service läuft.
+  if ! systemctl is-active --quiet atmed-backup-tier0.service 2>/dev/null; then
+    find /srv/atmed-backup/staging/tier0 -mindepth 1 -mtime +1 -print -exec rm -rf {} \; 2>/dev/null || true
+  fi
+
+  # Restic-Cache nicht aggressiv löschen, aber sehr alte Cache-Dateien entfernen.
+  find "${RESTIC_CACHE_DIR:-/root/.cache/restic}" -type f -mtime +30 -print -delete 2>/dev/null || true
+
+  echo "Runtime-Cleanup abgeschlossen. Exit-Code des Backup-Runs: $rc"
+  return "$rc"
+}
+
+trap atmed_bcc_cleanup_runtime_artifacts EXIT
+
+
+db_exec "INSERT INTO backup_runs
+        (run_id, trigger_type, backup_tier, started_at, status, status_icon, summary, log_path)
+        VALUES
+        ('$(sql_escape "$RUN_ID")',
+         'scheduled_or_manual',
+         'remote-restic-bcc-v2',
+         '$(sql_escape "$STARTED_AT")',
+         'running',
+         '🟡',
+         'Backup läuft',
+         '$(sql_escape "$LOG")');"
+
+PROVIDERS=("r2" "hetzner")
+ENDPOINTS=("mail" "monitor" "core" "com" "gateway" "backup" "atdig-core" "at-core")
+
+provider_repo() {
+  case "$1" in
+    r2) echo "${RESTIC_REPOSITORY_R2:?RESTIC_REPOSITORY_R2 fehlt}" ;;
+    hetzner) echo "${RESTIC_REPOSITORY_HETZNER:?RESTIC_REPOSITORY_HETZNER fehlt}" ;;
+    *) return 1 ;;
+  esac
+}
+
+
+
+# Robuste SSH/SCP Wrapper für BCC-Remote-Endpunkte.
+# Zweck:
+# - IPQoS none gegen hängende SSH-Verbindungen, insbesondere atmed-com.
+# - kurze Timeouts statt minutenlanges Hängen.
+# - Retry bei transienten SSH-/Netzwerkproblemen.
+ssh_bcc() {
+  local target="$1"
+  shift
+
+  # stdin einmal puffern, damit Heredoc-Skripte bei jedem Retry erneut
+  # vollständig an den Remote-Host übertragen werden.
+  local stdin_payload
+  stdin_payload="$(cat)"
+
+  local attempt rc
+  for attempt in 1 2 3; do
+    printf '%s\n' "$stdin_payload" | ssh \
+      -o IPQoS=none \
+      -o ConnectTimeout=20 \
+      -o BatchMode=yes \
+      -o ServerAliveInterval=10 \
+      -o ServerAliveCountMax=2 \
+      "$target" "$@" && return 0
+
+    rc=$?
+    echo "WARNUNG: ssh zu $target fehlgeschlagen, Versuch $attempt/3, rc=$rc" >&2
+    sleep $((attempt * 3))
+  done
+
+  return "$rc"
+}
+
+scp_bcc() {
+  local attempt rc
+  for attempt in 1 2 3; do
+    scp \
+      -q \
+      -o IPQoS=none \
+      -o ConnectTimeout=20 \
+      -o BatchMode=yes \
+      -o ServerAliveInterval=10 \
+      -o ServerAliveCountMax=2 \
+      "$@" && return 0
+
+    rc=$?
+    echo "WARNUNG: scp fehlgeschlagen, Versuch $attempt/3, rc=$rc" >&2
+    sleep $((attempt * 3))
+  done
+
+  return "$rc"
+}
+
+
+endpoint_alias() {
+  case "$1" in
+    mail) echo "AT-mail" ;;
+    monitor) echo "ATINFRA-control" ;;
+    core) echo "ATMED-core" ;;
+    com) echo "AT-com" ;;
+    gateway) echo "AT-gateway" ;;
+    backup) echo "AT-backup" ;;
+    atdig-core) echo "ATDIG-core" ;;
+    at-core) echo "AT-core" ;;
+    *) return 1 ;;
+  esac
+}
+
+notify "${NTFY_TOPIC_INFO:-atmed-notifications}" \
+  "💾 Backup gestartet" \
+  "Run $RUN_ID gestartet. Ziele: Cloudflare R2 und Hetzner Offsite Storage Box. Endpoints: mail, monitor, core, com, gateway, backup, atdig-core, at-core." \
+  "default"
+
+echo
+echo "=== Remote-Voraussetzungen auf Endpoints vorbereiten ==="
+
+for endpoint in "${ENDPOINTS[@]}"; do
+  alias="$(endpoint_alias "$endpoint")"
+
+  echo
+  echo "--- Endpoint: $endpoint / $alias ---"
+
+  ssh_bcc "$alias" 'bash -s' <<'REMOTE_PREP'
+set -euo pipefail
+
+echo "Remote host: $(hostname)"
+
+if ! command -v restic >/dev/null 2>&1; then
+  echo "FEHLER: restic fehlt auf $(hostname)"
+  exit 20
+fi
+
+if ! command -v rclone >/dev/null 2>&1; then
+  echo "FEHLER: rclone fehlt auf $(hostname)"
+  exit 21
+fi
+
+mkdir -p /root/.config/rclone /root/.cache/restic /var/log/atmed-bcc /tmp/atmed-bcc
+chmod 700 /root/.config /root/.config/rclone /root/.cache /root/.cache/restic /tmp/atmed-bcc
+
+echo "restic: $(command -v restic)"
+restic version
+echo "rclone: $(command -v rclone)"
+rclone version | sed -n '1,2p'
+grep PRETTY_NAME /etc/os-release || true
+REMOTE_PREP
+
+  scp_bcc /root/.config/rclone/rclone.conf "$alias:/root/.config/rclone/rclone.conf"
+  ssh_bcc "$alias" 'chmod 600 /root/.config/rclone/rclone.conf'
+
+  db_event "endpoint_prepared" "$endpoint" "" "ok" "Endpoint vorbereitet"
+done
+
+echo
+echo "=== Konsistente WordPress-Datenbankexporte erzeugen ==="
+
+for endpoint in at-core atdig-core; do
+  alias="$(endpoint_alias "$endpoint")"
+  case "$endpoint" in
+    at-core) site="andreas-tremml" ;;
+    atdig-core) site="at-digital-systems" ;;
+  esac
+
+  echo "--- Export: $site / $alias ---"
+  ssh_bcc "$alias" "/usr/local/sbin/atmed-wordpress-backup-export '$site' --export"
+  db_event "wordpress_database_export" "$endpoint" "" "ok" "Konsistenter MariaDB-Export erzeugt"
+done
+
+echo
+echo "=== Konsistente ATMED-core-Datenbankexporte erzeugen ==="
+CORE_DB_EXPORT_RESULT="$(ssh_bcc "ATMED-core" "/usr/local/sbin/atmed-core-db-export")"
+printf '%s\n' "$CORE_DB_EXPORT_RESULT"
+if ! printf '%s\n' "$CORE_DB_EXPORT_RESULT" | grep -qx 'STATUS=OK'; then
+  echo "FEHLER: ATMED-core-Datenbankexport wurde nicht erfolgreich abgeschlossen." >&2
+  exit 22
+fi
+CORE_DB_EXPORT_RUN_ID="$(printf '%s\n' "$CORE_DB_EXPORT_RESULT" | awk -F= '/^RUN_ID=/{print $2}' | tail -1)"
+[[ -n "$CORE_DB_EXPORT_RUN_ID" ]] || {
+  echo "FEHLER: ATMED-core-Datenbankexport lieferte keine Run-ID." >&2
+  exit 22
+}
+db_event "core_database_export" "core" "" "ok" "Konsistente Exporte: $CORE_DB_EXPORT_RUN_ID"
+
+echo
+echo "=== Backup pro Endpoint und Provider ==="
+
+SUCCESS_COUNT=0
+FAIL_COUNT=0
+SNAPSHOT_SUMMARY=""
+
+for endpoint in "${ENDPOINTS[@]}"; do
+  alias="$(endpoint_alias "$endpoint")"
+
+  include_paths="$(sqlite3 "$DB" "SELECT include_paths FROM bcc_backup_plans WHERE endpoint='$(sql_escape "$endpoint")' AND enabled=1;" || true)"
+  exclude_patterns="$(sqlite3 "$DB" "SELECT exclude_patterns FROM bcc_backup_plans WHERE endpoint='$(sql_escape "$endpoint")' AND enabled=1;" || true)"
+
+  if [ -z "$include_paths" ]; then
+    echo "WARNUNG: Kein aktiver Backup-Plan für $endpoint"
+    db_event "backup_plan_missing" "$endpoint" "" "warning" "Kein aktiver Backup-Plan"
+    continue
+  fi
+
+  for provider in "${PROVIDERS[@]}"; do
+    repo="$(provider_repo "$provider")"
+
+    echo
+    echo "############################################################"
+    echo "### Backup: endpoint=$endpoint provider=$provider"
+    echo "############################################################"
+
+    REMOTE_ENV="/tmp/atmed-bcc/env-$RUN_ID-$provider"
+    REMOTE_INCLUDES="/tmp/atmed-bcc/includes-$RUN_ID-$provider"
+    REMOTE_EXCLUDES="/tmp/atmed-bcc/excludes-$RUN_ID-$provider"
+
+    tmp_env="$(mktemp)"
+    tmp_includes="$(mktemp)"
+    tmp_excludes="$(mktemp)"
+
+    cat > "$tmp_env" <<EOFREMOTEENV
+RESTIC_PASSWORD="$RESTIC_PASSWORD"
+RESTIC_REPOSITORY="$repo"
+RCLONE_CONFIG="/root/.config/rclone/rclone.conf"
+RESTIC_CACHE_DIR="/root/.cache/restic"
+HOME="/root"
+XDG_CACHE_HOME="/root/.cache"
+EOFREMOTEENV
+
+    printf "%s\n" "$include_paths" > "$tmp_includes"
+    printf "%s\n" "$exclude_patterns" > "$tmp_excludes"
+
+    scp_bcc "$tmp_env" "$alias:$REMOTE_ENV"
+    scp_bcc "$tmp_includes" "$alias:$REMOTE_INCLUDES"
+    scp_bcc "$tmp_excludes" "$alias:$REMOTE_EXCLUDES"
+
+    rm -f "$tmp_env" "$tmp_includes" "$tmp_excludes"
+
+    ssh_bcc "$alias" "chmod 600 '$REMOTE_ENV' '$REMOTE_INCLUDES' '$REMOTE_EXCLUDES'"
+
+    RC=0
+    REMOTE_RESULT="$(
+      ssh_bcc "$alias" 'bash -s' -- "$REMOTE_ENV" "$REMOTE_INCLUDES" "$REMOTE_EXCLUDES" "$endpoint" "$provider" <<'REMOTE_BACKUP'
+set -euo pipefail
+
+REMOTE_ENV="$1"
+REMOTE_INCLUDES="$2"
+REMOTE_EXCLUDES="$3"
+ENDPOINT_NAME="$4"
+PROVIDER_NAME="$5"
+
+set -a
+. "$REMOTE_ENV"
+set +a
+
+HOST_OBSERVED="$(hostname)"
+START_EPOCH="$(date +%s)"
+
+EXISTING_PATHS=()
+
+while IFS= read -r p; do
+  [ -z "$p" ] && continue
+  if [ -e "$p" ]; then
+    EXISTING_PATHS+=("$p")
+  fi
+done < "$REMOTE_INCLUDES"
+
+if [ "${#EXISTING_PATHS[@]}" -eq 0 ]; then
+  echo "STATUS=FAILED"
+  echo "ERROR=Keine Include-Pfade vorhanden"
+  rm -f "$REMOTE_ENV" "$REMOTE_INCLUDES" "$REMOTE_EXCLUDES"
+  exit 10
+fi
+
+echo "HOST=$HOST_OBSERVED"
+printf "PATHS="
+printf " %s" "${EXISTING_PATHS[@]}"
+printf "\n"
+
+INIT_TMP="/tmp/atmed-bcc/restic-init.log"
+
+if ! restic snapshots --json >/dev/null 2>"$INIT_TMP"; then
+  if ! restic init >"$INIT_TMP" 2>&1; then
+    if grep -qi "config file already exists" "$INIT_TMP"; then
+      echo "restic init: Repository-Konfiguration existiert bereits, weiter."
+    else
+      cat "$INIT_TMP"
+      rm -f "$INIT_TMP" "$REMOTE_ENV" "$REMOTE_INCLUDES" "$REMOTE_EXCLUDES"
+      exit 10
+    fi
+  fi
+fi
+
+rm -f "$INIT_TMP"
+
+BACKUP_JSON="$(mktemp)"
+
+if restic backup "${EXISTING_PATHS[@]}" \
+  --retry-lock 5m \
+  --one-file-system \
+  --exclude-file "$REMOTE_EXCLUDES" \
+  --tag "atmed" \
+  --tag "bcc" \
+  --tag "endpoint:$ENDPOINT_NAME" \
+  --tag "provider:$PROVIDER_NAME" \
+  --json > "$BACKUP_JSON"; then
+
+  SNAPSHOT_ID="$(grep -E '"snapshot_id"' "$BACKUP_JSON" | tail -1 | sed -E 's/.*"snapshot_id":"?([^",}]+)"?.*/\1/' || true)"
+  BYTES_ADDED="$(grep -E '"total_bytes_processed"' "$BACKUP_JSON" | tail -1 | sed -E 's/.*"total_bytes_processed":([0-9]+).*/\1/' || true)"
+  FILES_NEW="$(grep -E '"files_new"' "$BACKUP_JSON" | tail -1 | sed -E 's/.*"files_new":([0-9]+).*/\1/' || true)"
+  FILES_CHANGED="$(grep -E '"files_changed"' "$BACKUP_JSON" | tail -1 | sed -E 's/.*"files_changed":([0-9]+).*/\1/' || true)"
+  FILES_UNMODIFIED="$(grep -E '"files_unmodified"' "$BACKUP_JSON" | tail -1 | sed -E 's/.*"files_unmodified":([0-9]+).*/\1/' || true)"
+echo "INFO=Prune bewusst nicht im Backup-Run ausgeführt; separate Maintenance erforderlich."
+
+  END_EPOCH="$(date +%s)"
+  DURATION="$((END_EPOCH - START_EPOCH))"
+
+  echo "STATUS=OK"
+  echo "SNAPSHOT_ID=${SNAPSHOT_ID:-}"
+  echo "BYTES_ADDED=${BYTES_ADDED:-0}"
+  echo "FILES_NEW=${FILES_NEW:-0}"
+  echo "FILES_CHANGED=${FILES_CHANGED:-0}"
+  echo "FILES_UNMODIFIED=${FILES_UNMODIFIED:-0}"
+  echo "DURATION=$DURATION"
+else
+  echo "STATUS=FAILED"
+  echo "ERROR=restic backup fehlgeschlagen"
+  tail -20 "$BACKUP_JSON" || true
+  rm -f "$BACKUP_JSON" "$REMOTE_ENV" "$REMOTE_INCLUDES" "$REMOTE_EXCLUDES"
+  exit 11
+fi
+
+rm -f "$BACKUP_JSON" "$REMOTE_ENV" "$REMOTE_INCLUDES" "$REMOTE_EXCLUDES"
+REMOTE_BACKUP
+    )" || RC=$?
+
+    echo "$REMOTE_RESULT"
+
+    if [ "$RC" -eq 0 ] && printf "%s\n" "$REMOTE_RESULT" | grep -q '^STATUS=OK'; then
+      SNAPSHOT_ID="$(printf "%s\n" "$REMOTE_RESULT" | awk -F= '/^SNAPSHOT_ID=/{print $2}' | tail -1)"
+      BYTES_ADDED="$(printf "%s\n" "$REMOTE_RESULT" | awk -F= '/^BYTES_ADDED=/{print $2}' | tail -1)"
+      FILES_NEW="$(printf "%s\n" "$REMOTE_RESULT" | awk -F= '/^FILES_NEW=/{print $2}' | tail -1)"
+      FILES_CHANGED="$(printf "%s\n" "$REMOTE_RESULT" | awk -F= '/^FILES_CHANGED=/{print $2}' | tail -1)"
+      DURATION="$(printf "%s\n" "$REMOTE_RESULT" | awk -F= '/^DURATION=/{print $2}' | tail -1)"
+
+      db_exec "INSERT INTO backup_snapshots
+              (run_id, endpoint, provider, backup_tier, snapshot_id, snapshot_time,
+               files_new, files_changed, files_removed, bytes_added, duration_seconds, status)
+              VALUES
+              ('$(sql_escape "$RUN_ID")',
+               '$(sql_escape "$endpoint")',
+               '$(sql_escape "$provider")',
+               'remote-restic-bcc-v2',
+               '$(sql_escape "$SNAPSHOT_ID")',
+               '$(sql_escape "$(date -Is)")',
+               ${FILES_NEW:-0},
+               ${FILES_CHANGED:-0},
+               0,
+               ${BYTES_ADDED:-0},
+               ${DURATION:-0},
+               'ok');"
+
+      db_event "backup_snapshot" "$endpoint" "$provider" "ok" "Snapshot $SNAPSHOT_ID"
+
+      SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+      SNAPSHOT_SUMMARY="${SNAPSHOT_SUMMARY}${endpoint}/${provider}: ${SNAPSHOT_ID}; "
+    else
+      ERROR_MSG="$(printf "%s\n" "$REMOTE_RESULT" | tail -20 | tr '\n' ' ' | cut -c1-700)"
+      echo "FEHLER: endpoint=$endpoint provider=$provider rc=$RC"
+      echo "$ERROR_MSG"
+
+      db_exec "INSERT INTO backup_snapshots
+              (run_id, endpoint, provider, backup_tier, snapshot_time,
+               files_new, files_changed, files_removed, bytes_added, duration_seconds,
+               status, error_message)
+              VALUES
+              ('$(sql_escape "$RUN_ID")',
+               '$(sql_escape "$endpoint")',
+               '$(sql_escape "$provider")',
+               'remote-restic-bcc-v2',
+               '$(sql_escape "$(date -Is)")',
+               0,0,0,0,0,
+               'failed',
+               '$(sql_escape "$ERROR_MSG")');"
+
+      db_event "backup_snapshot" "$endpoint" "$provider" "failed" "$ERROR_MSG"
+
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+  done
+done
+
+echo
+echo "=== Repository-Checks und Mini-Restore-Tests ==="
+
+CHECK_FAIL=0
+
+for provider in "${PROVIDERS[@]}"; do
+  repo="$(provider_repo "$provider")"
+
+  echo
+  echo "--- Provider prüfen: $provider ---"
+
+  CHECK_STARTED="$(date -Is)"
+  CHECK_RC=0
+  if restic -r "$repo" check > "$TMP_ROOT/check-$RUN_ID-$provider.log" 2>&1; then
+    CHECK_RC=0
+  else
+    CHECK_RC=$?
+  fi
+
+  if [ "$CHECK_RC" -eq 0 ]; then
+    echo "$provider: restic check OK"
+    db_exec "INSERT INTO backup_checks
+            (run_id, provider, check_type, started_at, finished_at, status, status_icon)
+            VALUES
+            ('$(sql_escape "$RUN_ID")',
+             '$(sql_escape "$provider")',
+             'restic-check',
+             '$(sql_escape "$CHECK_STARTED")',
+             '$(sql_escape "$(date -Is)")',
+             'ok',
+             '🟢');"
+    db_event "restic_check" "" "$provider" "ok" "restic check OK"
+  else
+    echo "$provider: restic check FEHLER"
+    CHECK_FAIL=$((CHECK_FAIL + 1))
+    ERR="$(tail -20 "$TMP_ROOT/check-$RUN_ID-$provider.log" 2>/dev/null | tr '\n' ' ' | cut -c1-700)"
+    db_exec "INSERT INTO backup_checks
+            (run_id, provider, check_type, started_at, finished_at, status, status_icon, error_message)
+            VALUES
+            ('$(sql_escape "$RUN_ID")',
+             '$(sql_escape "$provider")',
+             'restic-check',
+             '$(sql_escape "$CHECK_STARTED")',
+             '$(sql_escape "$(date -Is)")',
+             'failed',
+             '🔴',
+             '$(sql_escape "$ERR")');"
+    db_event "restic_check" "" "$provider" "failed" "$ERR"
+  fi
+
+  echo "--- Mini-Restore-Test: $provider ---"
+
+  RESTORE_PATH="$RESTORE_DIR/$RUN_ID/$provider"
+  mkdir -p "$RESTORE_PATH"
+
+  RESTORE_STARTED="$(date -Is)"
+  set +e
+  SNAP_JSON="$(restic -r "$repo" snapshots --json 2>/dev/null || true)"
+
+if echo "$SNAP_JSON" | jq empty >/dev/null 2>&1; then
+  LATEST_SNAPSHOT="$(echo "$SNAP_JSON" | jq -r '.[-1].short_id // empty')"
+else
+  LATEST_SNAPSHOT=""
+fi
+  if [ -n "$LATEST_SNAPSHOT" ]; then
+    restic -r "$repo" restore "$LATEST_SNAPSHOT" \
+      --target "$RESTORE_PATH" \
+      --include "/**/REMOTE-METADATA.txt" \
+      --include "/etc/hostname" \
+      --include "/etc/os-release" \
+      > "$TMP_ROOT/restore-$RUN_ID-$provider.log" 2>&1
+    RESTORE_RC=$?
+    if [ "$RESTORE_RC" -eq 0 ] && ! find "$RESTORE_PATH" -type f \( \
+      -path '*/REMOTE-METADATA.txt' -o \
+      -path '*/etc/hostname' -o \
+      -path '*/etc/os-release' \
+    \) -print -quit | grep -q .; then
+      echo "Mini-Restore lieferte keine erwarteten Dateien" >> "$TMP_ROOT/restore-$RUN_ID-$provider.log"
+      RESTORE_RC=13
+    fi
+  else
+    RESTORE_RC=12
+  fi
+  set -e
+
+  if [ "$RESTORE_RC" -eq 0 ]; then
+    echo "$provider: Mini-Restore OK"
+    db_exec "INSERT INTO restore_tests
+            (run_id, provider, snapshot_id, test_type, restore_path, started_at, finished_at, status, status_icon)
+            VALUES
+            ('$(sql_escape "$RUN_ID")',
+             '$(sql_escape "$provider")',
+             '$(sql_escape "$LATEST_SNAPSHOT")',
+             'mini-restore',
+             '$(sql_escape "$RESTORE_PATH")',
+             '$(sql_escape "$RESTORE_STARTED")',
+             '$(sql_escape "$(date -Is)")',
+             'ok',
+             '🟢');"
+    db_event "mini_restore" "" "$provider" "ok" "Mini-Restore OK"
+  else
+    echo "$provider: Mini-Restore FEHLER"
+    CHECK_FAIL=$((CHECK_FAIL + 1))
+    ERR="$(tail -20 "$TMP_ROOT/restore-$RUN_ID-$provider.log" 2>/dev/null | tr '\n' ' ' | cut -c1-700)"
+    db_exec "INSERT INTO restore_tests
+            (run_id, provider, snapshot_id, test_type, restore_path, started_at, finished_at, status, status_icon, error_message)
+            VALUES
+            ('$(sql_escape "$RUN_ID")',
+             '$(sql_escape "$provider")',
+             '$(sql_escape "${LATEST_SNAPSHOT:-}")',
+             'mini-restore',
+             '$(sql_escape "$RESTORE_PATH")',
+             '$(sql_escape "$RESTORE_STARTED")',
+             '$(sql_escape "$(date -Is)")',
+             'failed',
+             '🔴',
+             '$(sql_escape "$ERR")');"
+    db_event "mini_restore" "" "$provider" "failed" "$ERR"
+  fi
+
+  rm -rf "$RESTORE_PATH"
+done
+
+echo
+echo "=== Abschlussbewertung ==="
+
+if [ "$FAIL_COUNT" -eq 0 ] && [ "$CHECK_FAIL" -eq 0 ]; then
+  SUMMARY="Backup erfolgreich abgeschlossen. Snapshots: $SNAPSHOT_SUMMARY"
+
+  notify "${NTFY_TOPIC_INFO:-atmed-notifications}" \
+    "✅ Backup erfolgreich abgeschlossen" \
+    "Run $RUN_ID erfolgreich. Ziele Cloudflare R2 und Hetzner Offsite Storage Box wurden verarbeitet. Snapshots: $SNAPSHOT_SUMMARY" \
+    "default"
+
+  notify "${NTFY_TOPIC_INFO:-atmed-notifications}" \
+    "🛡️ Backup erfolgreich überprüft" \
+    "Run $RUN_ID: restic check und Mini-Restore-Test erfolgreich." \
+    "default"
+
+  finish_run_db "ok" "🟢" "$SUMMARY" ""
+  db_event "run_complete" "" "" "ok" "$SUMMARY"
+  echo "$SUMMARY"
+  exit 0
+fi
+
+if [ "$FAIL_COUNT" -gt 0 ]; then
+  MSG="Run $RUN_ID: Fehler bei $FAIL_COUNT Backup-Operation(en). Checks/Restore-Fehler: $CHECK_FAIL."
+  notify "${NTFY_TOPIC_ALERTS:-atmed-alerts}" \
+    "⚠️ Fehler bei Backup" \
+    "$MSG Siehe Log: $LOG" \
+    "high"
+
+  finish_run_db "failed" "🔴" "Backup mit Fehlern" "$MSG"
+  db_event "run_complete" "" "" "failed" "$MSG"
+  echo "$MSG"
+  trap - ERR
+  exit 2
+fi
+
+if [ "$CHECK_FAIL" -gt 0 ]; then
+  MSG="Run $RUN_ID: Backup erstellt, aber Prüfung/Restore-Test mit $CHECK_FAIL Fehler(n)."
+  notify "${NTFY_TOPIC_ALERTS:-atmed-alerts}" \
+    "⚠️ Fehler bei der Überprüfung der Backups" \
+    "$MSG Siehe Log: $LOG" \
+    "high"
+
+  finish_run_db "warning" "🟡" "Backup erstellt, Prüfung eingeschränkt" "$MSG"
+  db_event "run_complete" "" "" "warning" "$MSG"
+  echo "$MSG"
+  trap - ERR
+  exit 3
+fi

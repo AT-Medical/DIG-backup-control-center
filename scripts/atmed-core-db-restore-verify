@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Isolated import validation for atmed-core-db-export output.
+set -euo pipefail
+set +x
+umask 077
+
+usage() {
+  cat <<'EOF'
+Usage: atmed-core-db-restore-verify --export-dir PATH
+EOF
+}
+
+EXPORT_DIR=""
+while (( $# )); do
+  case "$1" in
+    --export-dir) EXPORT_DIR="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unsupported argument: $1" >&2; exit 64 ;;
+  esac
+done
+[[ -n "$EXPORT_DIR" && -r "$EXPORT_DIR/manifest.jsonl" ]] || { echo "Readable manifest required" >&2; exit 66; }
+for cmd in docker gzip python3 sha256sum; do command -v "$cmd" >/dev/null || exit 69; done
+
+RUN_ID="restore-$(date -u +%Y%m%dT%H%M%SZ)-$(openssl rand -hex 4)"
+WORK="/var/lib/atmed-bcc/restore-tests/$RUN_ID"
+mkdir -p "$WORK"
+chmod 700 "$WORK"
+containers=()
+cleanup() {
+  local c
+  for c in "${containers[@]:-}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT INT TERM HUP
+
+verify_hash() {
+  local file="$1" expected="$2" actual
+  actual="$(sha256sum "$file" | awk '{print $1}')"
+  [[ "$actual" == "$expected" ]] || { echo "Checksum mismatch: $(basename "$file")" >&2; exit 65; }
+}
+
+restore_mariadb() {
+  local container="$1" dump="$2" expected="$3" env="$WORK/mariadb.env" name="atmed-db-restore-${RUN_ID}-${container}"
+  verify_hash "$dump" "$expected"
+  gzip -t "$dump"
+  umask 077; printf 'MARIADB_ROOT_PASSWORD=%s\n' "$(openssl rand -hex 32)" > "$env"
+  docker run --rm -d --name "$name" --network none --env-file "$env" mariadb:11 >/dev/null
+  containers+=("$name")
+  for _ in $(seq 1 60); do
+    docker exec "$name" sh -c 'mariadb-admin -h 127.0.0.1 -uroot -p"$MARIADB_ROOT_PASSWORD" ping --silent' >/dev/null 2>&1 && break
+    sleep 1
+  done
+  docker exec "$name" sh -c 'mariadb-admin -h 127.0.0.1 -uroot -p"$MARIADB_ROOT_PASSWORD" ping --silent' >/dev/null
+  gzip -cd "$dump" | docker exec -i "$name" sh -ceu 'mariadb -h 127.0.0.1 -uroot -p"$MARIADB_ROOT_PASSWORD"'
+  tables="$(docker exec "$name" sh -ceu 'mariadb -h 127.0.0.1 -uroot -p"$MARIADB_ROOT_PASSWORD" -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN (\"mysql\",\"sys\",\"performance_schema\",\"information_schema\")"')"
+  [[ "$tables" =~ ^[1-9][0-9]*$ ]] || { echo "No restored user tables: $container" >&2; exit 65; }
+  echo "RESTORE_OK|mariadb|$container|tables=$tables"
+}
+
+restore_postgres_group() {
+  local container="$1" image="$2" globals="$3" globals_sha="$4" records="$5"
+  local env="$WORK/postgres.env" name="atmed-db-restore-${RUN_ID}-${container}"
+  verify_hash "$globals" "$globals_sha"; gzip -t "$globals"
+  umask 077; printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 32)" > "$env"
+  docker run --rm -d --name "$name" --network none --env-file "$env" "$image" >/dev/null
+  containers+=("$name")
+  for _ in $(seq 1 60); do docker exec "$name" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 && break; sleep 1; done
+  docker exec "$name" pg_isready -h 127.0.0.1 -U postgres >/dev/null
+  # The empty official image already owns the bootstrap postgres role. Preserve
+  # every exported global except that one role and its password-bearing ALTER.
+  gzip -cd "$globals" | sed '/^CREATE ROLE postgres;$/d; /^ALTER ROLE postgres /d' | \
+    docker exec -i "$name" psql -v ON_ERROR_STOP=1 -U postgres -d postgres >/dev/null
+  while IFS=$'\t' read -r database dump sha; do
+    verify_hash "$dump" "$sha"
+    docker exec "$name" createdb -U postgres "$database"
+    extensions_file="$WORK/${container}.${database}.extensions"
+    docker exec "$container" sh -ceu '
+      export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+      psql -U "${POSTGRES_USER:-postgres}" -d "$1" -Atc "SELECT extname FROM pg_extension ORDER BY extname"
+    ' sh "$database" > "$extensions_file"
+    mapfile -t extensions < "$extensions_file"
+    for extension in "${extensions[@]}"; do
+      [[ "$extension" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Unsupported extension identifier" >&2; exit 65; }
+      docker exec "$name" psql -v ON_ERROR_STOP=1 -U postgres -d "$database" -c "CREATE EXTENSION IF NOT EXISTS \"$extension\"" >/dev/null
+    done
+    # pg_dump intentionally clears search_path. This legacy BBB function has
+    # an unqualified extension call, so the documented restore session must
+    # restore the canonical public schema before pg_catalog.
+    docker run --rm --network none -v "$EXPORT_DIR:/exports:ro" "$image" \
+      pg_restore -f - "/exports/$(basename "$dump")" | \
+      sed "s/SELECT pg_catalog.set_config('search_path', '', false);/SELECT pg_catalog.set_config('search_path', 'public,pg_catalog', false);/" | \
+      docker exec -i "$name" psql -v ON_ERROR_STOP=1 -U postgres -d "$database" >/dev/null
+    tables="$(docker exec "$name" psql -U postgres -d "$database" -Atc "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema')")"
+    [[ "$tables" =~ ^[1-9][0-9]*$ ]] || { echo "No restored user tables: $container/$database" >&2; exit 65; }
+    echo "RESTORE_OK|postgres|$container/$database|tables=$tables"
+  done < "$records"
+}
+
+mapfile -t lines < <(python3 - "$EXPORT_DIR/manifest.jsonl" <<'PY'
+import json, sys
+for line in open(sys.argv[1], encoding='utf-8'):
+  o=json.loads(line)
+  print('\t'.join(str(o.get(k,'')) for k in ('engine','container','database','dump_file','sha256')))
+PY
+)
+(( ${#lines[@]} > 0 )) || { echo "Empty manifest" >&2; exit 65; }
+
+declare -A pg_globals_sha pg_globals_file pg_records pg_image
+for line in "${lines[@]}"; do
+  IFS=$'\t' read -r engine container database dump sha <<< "$line"
+  file="$EXPORT_DIR/$dump"
+  [[ -f "$file" ]] || { echo "Missing dump: $dump" >&2; exit 65; }
+  if [[ "$engine" == mariadb ]]; then
+    restore_mariadb "$container" "$file" "$sha"
+  elif [[ "$engine" == postgres && "$database" == __globals__ ]]; then
+    pg_globals_file["$container"]="$file"; pg_globals_sha["$container"]="$sha"
+    image="$(docker inspect -f '{{.Config.Image}}' "$container" 2>/dev/null || true)"
+    [[ "$image" == *postgres* ]] || { echo "Source image unavailable: $container" >&2; exit 65; }
+    pg_image["$container"]="$image"
+  elif [[ "$engine" == postgres ]]; then
+    pg_records["$container"]+="$database"$'\t'"$file"$'\t'"$sha"$'\n'
+  else
+    echo "Unsupported manifest record" >&2; exit 65
+  fi
+done
+for container in "${!pg_records[@]}"; do
+  [[ -n "${pg_globals_file[$container]:-}" ]] || { echo "Missing globals dump: $container" >&2; exit 65; }
+  records="$WORK/$container.records"
+  printf '%s' "${pg_records[$container]}" > "$records"
+  restore_postgres_group "$container" "${pg_image[$container]}" "${pg_globals_file[$container]}" "${pg_globals_sha[$container]}" "$records"
+done
+echo "STATUS=OK"

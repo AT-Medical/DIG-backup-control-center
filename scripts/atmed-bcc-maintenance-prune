@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TS="$(date +%Y%m%d-%H%M%S)"
+LOG_DIR="/srv/atmed-backup-control/logs"
+LOG="$LOG_DIR/maintenance-prune-$TS.log"
+LOCK="/run/atmed-bcc-maintenance-prune.lock"
+
+AGE_KEY_FILE="/root/.config/sops/age/keys.txt"
+SECRET_SOPS="/etc/atmed-backup/secrets/remote-backup.sops.env"
+
+mkdir -p "$LOG_DIR"
+
+exec > >(tee -a "$LOG") 2>&1
+
+echo "============================================================"
+echo " ATMED BCC Repository Maintenance / Restic Prune"
+echo " Date: $(date -Is)"
+echo " Log: $LOG"
+echo "============================================================"
+echo
+
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "ABBRUCH: Maintenance läuft bereits."
+  exit 1
+fi
+
+if systemctl is-active --quiet atmed-bcc-backup.service; then
+  echo "ABBRUCH: Backup-Service läuft gerade. Kein Prune während eines Backups."
+  exit 1
+fi
+
+echo "=== Secrets laden ==="
+set -a
+. <(SOPS_AGE_KEY_FILE="$AGE_KEY_FILE" sops -d "$SECRET_SOPS")
+set +a
+
+export RESTIC_PASSWORD
+export RCLONE_CONFIG="/root/.config/rclone/rclone.conf"
+export RESTIC_CACHE_DIR="/root/.cache/restic"
+
+PROVIDERS=("r2" "hetzner")
+ENDPOINTS=("mail" "monitor" "core" "com")
+
+for PROVIDER in "${PROVIDERS[@]}"; do
+  case "$PROVIDER" in
+    r2)
+      export RESTIC_REPOSITORY="$RESTIC_REPOSITORY_R2"
+      ;;
+    hetzner)
+      export RESTIC_REPOSITORY="$RESTIC_REPOSITORY_HETZNER"
+      ;;
+  esac
+
+  echo
+  echo "############################################################"
+  echo "### Provider: $PROVIDER"
+  echo "############################################################"
+
+  echo
+  echo "=== Stale Locks bereinigen ==="
+  restic unlock || true
+
+  echo
+  echo "=== Snapshots vor Retention ==="
+  restic snapshots --compact || true
+
+  for ENDPOINT in "${ENDPOINTS[@]}"; do
+    echo
+    echo "--- Retention anwenden: provider=$PROVIDER endpoint=$ENDPOINT ---"
+    restic forget \
+      --tag "endpoint:$ENDPOINT" \
+      --keep-daily 14 \
+      --keep-weekly 8 \
+      --keep-monthly 12 \
+      --keep-yearly 3
+  done
+
+  echo
+  echo "=== Prune ausführen: provider=$PROVIDER ==="
+  restic prune
+
+  echo
+  echo "=== Repository Check: provider=$PROVIDER ==="
+  restic check
+
+  echo
+  echo "=== Snapshots nach Prune ==="
+  restic snapshots --compact || true
+done
+
+echo
+echo "=== Restic Cache Cleanup ==="
+restic cache --cleanup || true
+
+echo
+echo "============================================================"
+echo " Maintenance erfolgreich abgeschlossen"
+echo " Ende: $(date -Is)"
+echo "============================================================"
